@@ -19,8 +19,18 @@ Required environment values: `SUPABASE_URL`, `SUPABASE_ANON_KEY`,
 
 GitHub OAuth also needs `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and
 `GITHUB_REDIRECT_URI`. The callback exchanges an OAuth code, stores the
-token encrypted, and returns only connection metadata. GitLab follows the
-same provider contract; Bitbucket is intentionally not exposed yet.
+token encrypted, and returns only connection metadata.
+
+GitLab OAuth needs `GITLAB_CLIENT_ID`, `GITLAB_CLIENT_SECRET`, and
+`GITLAB_REDIRECT_URI`. It targets gitlab.com by default; set `GITLAB_URL`
+to point at a self-hosted instance instead. The flow is identical to
+GitHub's, just under the `/gitlab/...` paths:
+
+1. `GET /gitlab/authorize?organization_id=...` → send the browser to `authorize_url`.
+2. `GET /gitlab/callback` verifies the one-time OAuth state, exchanges the code, and stores the token encrypted.
+3. `GET /organizations/{organization_id}/integrations/{integration_id}/gitlab/repositories` lists accessible projects; `PUT .../gitlab/repository` saves a verified selection (`full_name` = GitLab's `namespace/path`).
+
+Bitbucket is intentionally not exposed yet.
 
 GitHub flow:
 
@@ -36,3 +46,38 @@ GitHub flow:
 Repository selection is stored as connection metadata only. It deliberately
 does not invoke SecureFlow's legacy scanner until the deployment has chosen a
 safe, authenticated scan-handoff adapter for private repositories.
+
+## Container registries
+
+Supported providers: Docker Hub, Amazon ECR, GHCR. Each requires provider-
+specific credentials in the `POST /organizations/{organization_id}/registries`
+body:
+
+| provider   | credential fields                                   |
+|------------|------------------------------------------------------|
+| `dockerhub`| `username`, `password` (a Docker Hub PAT is recommended) |
+| `ghcr`     | `username`, `token` (a GitHub PAT with `read:packages`)  |
+| `ecr`      | `access_key_id`, `secret_access_key`, `region`        |
+
+Credentials are verified against the real provider (Docker Hub login,
+`GET /user` on GitHub, or STS `GetCallerIdentity` on AWS) before anything is
+persisted — a registry is never marked "connected" on unverified input. Only
+the encrypted blob is stored; responses never echo credentials back.
+
+Flow:
+
+1. `POST .../registries` — connect + validate credentials.
+2. `GET .../integrations/{id}/registries/images` — list repositories/packages.
+3. `GET .../integrations/{id}/registries/images/{repository}/tags` — list tags for one image.
+4. `PUT .../integrations/{id}/registries/image` — save the selected `repository` + `reference_prefix` + `tag`.
+5. `POST .../integrations/{id}/registries/scan` — pull and scan the selected (or explicitly passed) image with Trivy, using short-lived env-var credentials handed only to that subprocess call, and persist findings through the existing project/scan/findings pipeline.
+6. `DELETE .../integrations/{id}` — disconnect/revoke, same as any other integration.
+
+Unlike the GitHub repository flow, registry image scanning *does* call into
+the legacy scanning pipeline (`scanners/container_runner.py`,
+`parsers/container_parser.py`, `services/db_service.py`) — there's no
+meaningful way to "scan an image" without it, and doing so doesn't require
+touching or duplicating that code. `run_container_scan` gained an optional
+`env` parameter for this; callers that don't pass it are unaffected.
+
+ECR support requires `boto3` (see `requirements.txt`).

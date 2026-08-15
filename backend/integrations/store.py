@@ -51,7 +51,7 @@ def initialize() -> None:
               scopes JSONB NOT NULL, created_by TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
               last_used_at TIMESTAMPTZ, revoked_at TIMESTAMPTZ
             );
-            CREATE TABLE IF NOT EXISTS sf_github_oauth_states (
+            CREATE TABLE IF NOT EXISTS sf_oauth_states (
               state_hash TEXT PRIMARY KEY,
               organization_id BIGINT NOT NULL REFERENCES sf_organizations(id) ON DELETE CASCADE,
               user_id TEXT NOT NULL,
@@ -102,20 +102,30 @@ def revoke_integration(organization_id: int, integration_id: int) -> bool:
         return cur.rowcount == 1
 
 
-def get_active_integration(organization_id: int, integration_id: int, provider: str) -> dict | None:
+def get_active_integration(organization_id: int, integration_id: int, provider: str | tuple[str, ...] | None) -> dict | None:
     """Return one active integration, including its encrypted secret.
+
+    ``provider`` may be a single provider name, a tuple of acceptable
+    providers, or ``None`` to accept any provider.
 
     This is intentionally private to server-side provider adapters. Route
     responses must use ``list_integrations`` instead so secrets never leave
     the service.
     """
+    provider_filter = ""
+    params: tuple = (integration_id, organization_id)
+    if provider is not None:
+        providers = (provider,) if isinstance(provider, str) else tuple(provider)
+        provider_filter = "AND provider = ANY(%s)"
+        params = (integration_id, organization_id, list(providers))
+
     with db() as conn, conn.cursor() as cur:
         cur.execute(
-            """SELECT id, organization_id, provider, name, encrypted_credentials, metadata
+            f"""SELECT id, organization_id, provider, name, encrypted_credentials, metadata
                FROM sf_integrations
-               WHERE id=%s AND organization_id=%s AND provider=%s
+               WHERE id=%s AND organization_id=%s {provider_filter}
                  AND status='connected' AND revoked_at IS NULL""",
-            (integration_id, organization_id, provider),
+            params,
         )
         row = cur.fetchone()
         return dict(row) if row else None
@@ -133,20 +143,25 @@ def update_integration_metadata(organization_id: int, integration_id: int, metad
         return dict(row) if row else None
 
 
-def put_github_oauth_state(state_hash: str, organization_id: int, user_id: str) -> None:
+def put_oauth_state(state_hash: str, organization_id: int, user_id: str) -> None:
     with db() as conn, conn.cursor() as cur:
         cur.execute(
-            """INSERT INTO sf_github_oauth_states (state_hash, organization_id, user_id, expires_at)
+            """INSERT INTO sf_oauth_states (state_hash, organization_id, user_id, expires_at)
                VALUES (%s, %s, %s, now() + interval '10 minutes')""",
             (state_hash, organization_id, user_id),
         )
 
 
-def consume_github_oauth_state(state_hash: str) -> dict | None:
-    """Consume a state exactly once, rejecting expired callbacks."""
+def consume_oauth_state(state_hash: str) -> dict | None:
+    """Consume a state exactly once, rejecting expired callbacks.
+
+    Shared across every OAuth-based provider (GitHub, GitLab, ...) — the
+    state token itself is opaque and random, so there's no need for a
+    separate table per provider.
+    """
     with db() as conn, conn.cursor() as cur:
         cur.execute(
-            """DELETE FROM sf_github_oauth_states
+            """DELETE FROM sf_oauth_states
                WHERE state_hash=%s AND expires_at > now()
                RETURNING organization_id, user_id""",
             (state_hash,),

@@ -20,8 +20,18 @@ from pydantic import BaseModel, Field
 
 from integrations import store
 from integrations import github
+from integrations import gitlab
+from integrations import registries
 from integrations.permissions import require_role_permission
 from integrations.security import current_user_id, decrypt_secret, encrypt_secret, generate_api_key
+
+# Container image scanning reuses the existing Trivy runner and finding
+# pipeline rather than re-implementing them — this is the one deliberate
+# exception to this package's usual isolation from the legacy backend,
+# because "scan the image" has no meaning as a duplicate implementation.
+from parsers.container_parser import normalize_container_findings
+from scanners.container_runner import run_container_scan
+from services.db_service import create_scan, finish_scan, get_or_create_project, insert_findings
 
 app = FastAPI(title="SecureFlow Integrations", version="1.0.0")
 
@@ -50,6 +60,22 @@ class RegistryConnect(BaseModel):
 
 class GitHubRepositorySelection(BaseModel):
     full_name: str = Field(min_length=3, max_length=300)
+
+
+class GitLabRepositorySelection(BaseModel):
+    full_name: str = Field(min_length=3, max_length=300)
+
+
+class RegistryImageSelection(BaseModel):
+    repository: str = Field(min_length=1, max_length=300)
+    reference_prefix: str = Field(min_length=1, max_length=400)
+    tag: str = Field(min_length=1, max_length=200)
+
+
+class RegistryScanRequest(BaseModel):
+    # Optional override; defaults to the integration's previously-selected image.
+    reference_prefix: str | None = Field(default=None, max_length=400)
+    tag: str | None = Field(default=None, max_length=200)
 
 
 def _assert(organization_id: int, user_id: str, permission: str) -> None:
@@ -103,8 +129,99 @@ def connect_registry(organization_id: int, payload: RegistryConnect, user_id: st
     _assert(organization_id, user_id, "integrations:manage")
     if not payload.credentials or any(not value for value in payload.credentials.values()):
         raise HTTPException(status_code=400, detail="Registry credentials are required")
-    # Validation is provider-specific and does not retain plaintext beyond this request.
-    return store.put_integration(organization_id, payload.provider, payload.name.strip(), encrypt_secret(str(payload.credentials)), {"credential_fields": sorted(payload.credentials)}, user_id)
+    # Credentials are checked against the real provider before anything is
+    # persisted — a registry is never marked "connected" on unverified input.
+    account = registries.validate_credentials(payload.provider, payload.credentials)
+    integration = store.put_integration(
+        organization_id,
+        payload.provider,
+        payload.name.strip(),
+        encrypt_secret(json.dumps(payload.credentials)),
+        {"credential_fields": sorted(payload.credentials), "account": account},
+        user_id,
+    )
+    return integration
+
+
+@app.get("/organizations/{organization_id}/integrations/{integration_id}/registries/images")
+def registry_images(
+    organization_id: int,
+    integration_id: int,
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=50, ge=1, le=100),
+    user_id: str = Depends(current_user_id),
+):
+    _assert(organization_id, user_id, "integrations:manage")
+    integration, credentials = _registry_credentials(organization_id, integration_id)
+    return {"images": registries.list_images(integration["provider"], credentials, page, per_page), "page": page, "per_page": per_page}
+
+
+@app.get("/organizations/{organization_id}/integrations/{integration_id}/registries/images/{repository}/tags")
+def registry_image_tags(organization_id: int, integration_id: int, repository: str, user_id: str = Depends(current_user_id)):
+    _assert(organization_id, user_id, "integrations:manage")
+    integration, credentials = _registry_credentials(organization_id, integration_id)
+    return {"tags": registries.list_tags(integration["provider"], credentials, repository)}
+
+
+@app.put("/organizations/{organization_id}/integrations/{integration_id}/registries/image")
+def select_registry_image(
+    organization_id: int,
+    integration_id: int,
+    payload: RegistryImageSelection,
+    user_id: str = Depends(current_user_id),
+):
+    _assert(organization_id, user_id, "integrations:manage")
+    integration, _ = _registry_credentials(organization_id, integration_id)
+    selected = {"repository": payload.repository, "reference_prefix": payload.reference_prefix, "tag": payload.tag}
+    metadata = {**integration["metadata"], "selected_image": selected}
+    updated = store.update_integration_metadata(organization_id, integration_id, metadata)
+    return {"integration": updated, "selected_image": selected}
+
+
+@app.post("/organizations/{organization_id}/integrations/{integration_id}/registries/scan")
+def scan_registry_image(
+    organization_id: int,
+    integration_id: int,
+    payload: RegistryScanRequest,
+    user_id: str = Depends(current_user_id),
+):
+    _assert(organization_id, user_id, "scans:run")
+    integration, credentials = _registry_credentials(organization_id, integration_id)
+
+    selected = integration["metadata"].get("selected_image") or {}
+    reference_prefix = payload.reference_prefix or selected.get("reference_prefix")
+    tag = payload.tag or selected.get("tag")
+    if not reference_prefix or not tag:
+        raise HTTPException(status_code=400, detail="No image selected — select an image and tag, or pass one in the request")
+
+    image_ref = f"{reference_prefix}:{tag}"
+    env = registries.trivy_env(integration["provider"], credentials)
+
+    project_id = get_or_create_project(user_id, name=image_ref, source_type="upload")
+    scan_id = create_scan(user_id, project_id, "container")
+    try:
+        raw_results = run_container_scan(image_ref, env=env)
+        findings = normalize_container_findings(raw_results)
+        insert_findings(user_id, scan_id, project_id, findings)
+        finish_scan(user_id, scan_id, "completed")
+        return {"image": image_ref, "findings": findings}
+    except Exception as exc:
+        finish_scan(user_id, scan_id, "failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+REGISTRY_PROVIDERS = ("dockerhub", "ecr", "ghcr")
+
+
+def _registry_credentials(organization_id: int, integration_id: int) -> tuple[dict, dict]:
+    integration = store.get_active_integration(organization_id, integration_id, REGISTRY_PROVIDERS)
+    if not integration:
+        raise HTTPException(status_code=404, detail="Active registry integration not found")
+    try:
+        credentials = json.loads(decrypt_secret(integration["encrypted_credentials"]))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail="Stored registry credentials are invalid") from exc
+    return integration, credentials
 
 
 @app.get("/organizations/{organization_id}/integrations")
@@ -126,13 +243,13 @@ def github_authorize(organization_id: int = Query(...), user_id: str = Depends(c
     _assert(organization_id, user_id, "integrations:manage")
     client_id, redirect_uri = github.authorize_settings()
     state = secrets.token_urlsafe(32)
-    store.put_github_oauth_state(hashlib.sha256(state.encode()).hexdigest(), organization_id, user_id)
+    store.put_oauth_state(hashlib.sha256(state.encode()).hexdigest(), organization_id, user_id)
     return {"authorize_url": "https://github.com/login/oauth/authorize?" + urlencode({"client_id": client_id, "redirect_uri": redirect_uri, "scope": "repo read:org", "state": state})}
 
 
 @app.get("/github/callback")
 def github_callback(code: str = Query(..., min_length=1), state: str = Query(..., min_length=1)):
-    state_record = store.consume_github_oauth_state(hashlib.sha256(state.encode()).hexdigest())
+    state_record = store.consume_oauth_state(hashlib.sha256(state.encode()).hexdigest())
     if not state_record:
         raise HTTPException(status_code=400, detail="Invalid, expired, or already-used OAuth state")
     token = github.exchange_code(code)
@@ -186,6 +303,87 @@ def select_github_repository(
     _assert(organization_id, user_id, "integrations:manage")
     integration, token = _github_token(organization_id, integration_id)
     repository = github.get_repository(token, payload.full_name)
+    metadata = {**integration["metadata"], "selected_repository": repository}
+    updated = store.update_integration_metadata(organization_id, integration_id, metadata)
+    return {"integration": updated, "repository": repository}
+
+
+@app.get("/gitlab/authorize")
+def gitlab_authorize(organization_id: int = Query(...), user_id: str = Depends(current_user_id)):
+    _assert(organization_id, user_id, "integrations:manage")
+    client_id, redirect_uri, instance_url = gitlab.authorize_settings()
+    state = secrets.token_urlsafe(32)
+    store.put_oauth_state(hashlib.sha256(state.encode()).hexdigest(), organization_id, user_id)
+    return {
+        "authorize_url": f"{instance_url}/oauth/authorize?"
+        + urlencode(
+            {
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "scope": "read_api read_repository",
+                "state": state,
+            }
+        )
+    }
+
+
+@app.get("/gitlab/callback")
+def gitlab_callback(code: str = Query(..., min_length=1), state: str = Query(..., min_length=1)):
+    state_record = store.consume_oauth_state(hashlib.sha256(state.encode()).hexdigest())
+    if not state_record:
+        raise HTTPException(status_code=400, detail="Invalid, expired, or already-used OAuth state")
+    token = gitlab.exchange_code(code)
+    account = gitlab.authenticated_user(token["access_token"])
+    credentials = {key: token[key] for key in ("access_token", "refresh_token", "token_type", "scope") if token.get(key)}
+    integration = store.put_integration(
+        state_record["organization_id"],
+        "gitlab",
+        account["login"],
+        encrypt_secret(json.dumps(credentials)),
+        {"gitlab_account": account},
+        state_record["user_id"],
+    )
+    return {"connected": True, "integration": integration}
+
+
+def _gitlab_token(organization_id: int, integration_id: int) -> tuple[dict, str]:
+    integration = store.get_active_integration(organization_id, integration_id, "gitlab")
+    if not integration:
+        raise HTTPException(status_code=404, detail="Active GitLab integration not found")
+    try:
+        credentials = json.loads(decrypt_secret(integration["encrypted_credentials"]))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail="Stored GitLab credentials are invalid") from exc
+    token = credentials.get("access_token")
+    if not token:
+        raise HTTPException(status_code=500, detail="Stored GitLab credentials are incomplete")
+    return integration, token
+
+
+@app.get("/organizations/{organization_id}/integrations/{integration_id}/gitlab/repositories")
+def gitlab_repositories(
+    organization_id: int,
+    integration_id: int,
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=100, ge=1, le=100),
+    user_id: str = Depends(current_user_id),
+):
+    _assert(organization_id, user_id, "integrations:manage")
+    _, token = _gitlab_token(organization_id, integration_id)
+    return {"repositories": gitlab.list_repositories(token, page, per_page), "page": page, "per_page": per_page}
+
+
+@app.put("/organizations/{organization_id}/integrations/{integration_id}/gitlab/repository")
+def select_gitlab_repository(
+    organization_id: int,
+    integration_id: int,
+    payload: GitLabRepositorySelection,
+    user_id: str = Depends(current_user_id),
+):
+    _assert(organization_id, user_id, "integrations:manage")
+    integration, token = _gitlab_token(organization_id, integration_id)
+    repository = gitlab.get_repository(token, payload.full_name)
     metadata = {**integration["metadata"], "selected_repository": repository}
     updated = store.update_integration_metadata(organization_id, integration_id, metadata)
     return {"integration": updated, "repository": repository}
