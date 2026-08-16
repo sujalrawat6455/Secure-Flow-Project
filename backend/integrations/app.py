@@ -16,6 +16,8 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from integrations import store
@@ -30,10 +32,37 @@ from integrations.security import current_user_id, decrypt_secret, encrypt_secre
 # exception to this package's usual isolation from the legacy backend,
 # because "scan the image" has no meaning as a duplicate implementation.
 from parsers.container_parser import normalize_container_findings
+from parsers.secrets_parser import normalize_secret_findings
+from parsers.semgrep_parser import normalize_findings as normalize_semgrep_findings
+from parsers.trivy_parser import normalize_trivy_findings
 from scanners.container_runner import run_container_scan
+from scanners.semgrep_runner import run_semgrep
+from scanners.trivy_runner import run_trivy
+from secret_detection.scanner import scan_directory_for_secrets
 from services.db_service import create_scan, finish_scan, get_or_create_project, insert_findings
+from services.git_service import build_authenticated_url, cleanup_repo, clone_repo
 
 app = FastAPI(title="SecureFlow Integrations", version="1.0.0")
+
+# Mounted as a sub-app under the main FastAPI instance, so it does NOT
+# inherit the parent app's CORS middleware — Starlette does not propagate
+# middleware to mounted sub-apps. Kept in sync with main.py's allow list.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:8080",
+        "http://192.168.1.4:8080",
+    ],
+    allow_origin_regex=(
+        r"https://([a-zA-Z0-9-]+--)?secureflow-laati\.lovable\.app"
+        r"|https://id-preview--3418111a-32b7-4c0f-8a4f-6ea92ef21a06\.lovable\.app"
+    ),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 VALID_SCOPES = {"projects:read", "projects:write", "scans:read", "scans:run", "findings:read", "reports:read", "settings:manage", "integrations:manage"}
 
@@ -80,6 +109,20 @@ class RegistryScanRequest(BaseModel):
 
 def _assert(organization_id: int, user_id: str, permission: str) -> None:
     require_role_permission(store.role_for(organization_id, user_id), permission)
+
+
+def _oauth_result(provider: str, integration: dict | None, error: str | None = None):
+    """Send the browser back to the dashboard's Integrations page after an
+    OAuth callback. Falls back to a plain JSON body (the original response
+    shape) when INTEGRATIONS_FRONTEND_URL isn't configured, so this stays
+    usable for direct API testing too."""
+    frontend_url = os.getenv("INTEGRATIONS_FRONTEND_URL", "").rstrip("/")
+    if not frontend_url:
+        if error:
+            raise HTTPException(status_code=400, detail=error)
+        return {"connected": True, "integration": integration}
+    params = {"connected": provider} if not error else {"error": error, "provider": provider}
+    return RedirectResponse(f"{frontend_url}/dashboard/integrations?{urlencode(params)}")
 
 
 @app.on_event("startup")
@@ -251,7 +294,7 @@ def github_authorize(organization_id: int = Query(...), user_id: str = Depends(c
 def github_callback(code: str = Query(..., min_length=1), state: str = Query(..., min_length=1)):
     state_record = store.consume_oauth_state(hashlib.sha256(state.encode()).hexdigest())
     if not state_record:
-        raise HTTPException(status_code=400, detail="Invalid, expired, or already-used OAuth state")
+        return _oauth_result("github", None, error="Invalid, expired, or already-used OAuth state")
     token = github.exchange_code(code)
     account = github.authenticated_user(token["access_token"])
     credentials = {key: token[key] for key in ("access_token", "token_type", "scope") if token.get(key)}
@@ -263,7 +306,7 @@ def github_callback(code: str = Query(..., min_length=1), state: str = Query(...
         {"github_account": account},
         state_record["user_id"],
     )
-    return {"connected": True, "integration": integration}
+    return _oauth_result("github", integration)
 
 
 def _github_token(organization_id: int, integration_id: int) -> tuple[dict, str]:
@@ -308,6 +351,56 @@ def select_github_repository(
     return {"integration": updated, "repository": repository}
 
 
+def _scan_selected_repository(organization_id: int, integration: dict, token: str, provider: str, user_id: str) -> dict:
+    """Clone the integration's selected repo with the stored OAuth token and
+    run the same SAST + SCA + secrets scanners the legacy routes use.
+
+    This is the completion of the GitHub/GitLab "Select repo → Scan" flow —
+    the repository README previously described this step as deliberately
+    unimplemented pending an authenticated clone adapter; this is that adapter.
+    """
+    repository = integration["metadata"].get("selected_repository")
+    if not repository or not repository.get("clone_url"):
+        raise HTTPException(status_code=400, detail="No repository selected for this integration yet")
+
+    clone_url = repository["clone_url"]
+    auth_url = build_authenticated_url(clone_url, token, provider)
+
+    project_id = get_or_create_project(user_id, name=repository.get("full_name") or repository.get("name"), source_type="git", repo_url=repository.get("html_url") or clone_url)
+    scan_id = create_scan(user_id, project_id, "sast")
+
+    repo_path = None
+    try:
+        repo_path = clone_repo(auth_url, log_url=clone_url)
+        findings = []
+        findings += normalize_semgrep_findings(run_semgrep(repo_path))
+        findings += normalize_trivy_findings(run_trivy(repo_path))
+        findings += normalize_secret_findings(scan_directory_for_secrets(repo_path))
+        insert_findings(user_id, scan_id, project_id, findings)
+        finish_scan(user_id, scan_id, "completed")
+        return {"repository": repository, "findings": findings}
+    except Exception as exc:
+        finish_scan(user_id, scan_id, "failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        if repo_path:
+            cleanup_repo(repo_path)
+
+
+@app.post("/organizations/{organization_id}/integrations/{integration_id}/github/scan")
+def scan_github_repository(organization_id: int, integration_id: int, user_id: str = Depends(current_user_id)):
+    _assert(organization_id, user_id, "scans:run")
+    integration, token = _github_token(organization_id, integration_id)
+    return _scan_selected_repository(organization_id, integration, token, "github", user_id)
+
+
+@app.post("/organizations/{organization_id}/integrations/{integration_id}/gitlab/scan")
+def scan_gitlab_repository(organization_id: int, integration_id: int, user_id: str = Depends(current_user_id)):
+    _assert(organization_id, user_id, "scans:run")
+    integration, token = _gitlab_token(organization_id, integration_id)
+    return _scan_selected_repository(organization_id, integration, token, "gitlab", user_id)
+
+
 @app.get("/gitlab/authorize")
 def gitlab_authorize(organization_id: int = Query(...), user_id: str = Depends(current_user_id)):
     _assert(organization_id, user_id, "integrations:manage")
@@ -332,7 +425,7 @@ def gitlab_authorize(organization_id: int = Query(...), user_id: str = Depends(c
 def gitlab_callback(code: str = Query(..., min_length=1), state: str = Query(..., min_length=1)):
     state_record = store.consume_oauth_state(hashlib.sha256(state.encode()).hexdigest())
     if not state_record:
-        raise HTTPException(status_code=400, detail="Invalid, expired, or already-used OAuth state")
+        return _oauth_result("gitlab", None, error="Invalid, expired, or already-used OAuth state")
     token = gitlab.exchange_code(code)
     account = gitlab.authenticated_user(token["access_token"])
     credentials = {key: token[key] for key in ("access_token", "refresh_token", "token_type", "scope") if token.get(key)}
@@ -344,7 +437,7 @@ def gitlab_callback(code: str = Query(..., min_length=1), state: str = Query(...
         {"gitlab_account": account},
         state_record["user_id"],
     )
-    return {"connected": True, "integration": integration}
+    return _oauth_result("gitlab", integration)
 
 
 def _gitlab_token(organization_id: int, integration_id: int) -> tuple[dict, str]:

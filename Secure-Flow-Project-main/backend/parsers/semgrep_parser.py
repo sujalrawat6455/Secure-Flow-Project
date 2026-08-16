@@ -1,0 +1,81 @@
+import logging
+
+from mappings.iso27001 import get_iso_control
+from services.priority_service import compute_cwe_priority
+from utils.severity import normalize_severity
+
+logger = logging.getLogger(__name__)
+
+
+def get_code_context(filepath: str, start_line: int, end_line: int, context: int = 2):
+    """Read a few lines of real source around the finding, for display in the UI."""
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+
+        start = max(0, start_line - 1 - context)
+        end = min(len(lines), end_line + context)
+
+        return [
+            {
+                "ln": i + 1,
+                "code": lines[i].rstrip("\n"),
+                "highlight": start_line <= i + 1 <= end_line,
+            }
+            for i in range(start, end)
+        ]
+    except OSError as exc:
+        logger.debug("Could not read source context from %s: %s", filepath, exc)
+        return []
+
+
+def normalize_findings(data):
+    findings = []
+
+    for result in data["results"]:
+        metadata = result["extra"].get("metadata", {})
+
+        # Semgrep gives CWE as a list like ["CWE-89: SQL Injection"], take the first
+        cwe_list = metadata.get("cwe", [])
+        cwe = cwe_list[0].split(":")[0] if cwe_list else "CWE-000"
+
+        # OWASP comes as a list like ["A03:2021 - Injection"]
+        owasp_list = metadata.get("owasp", [])
+        owasp = owasp_list[0].split(" ")[0] if owasp_list else "A05:2021"
+
+        start_line = result["start"]["line"]
+        end_line = result["end"]["line"]
+
+        iso = get_iso_control(cwe=cwe, scanner="semgrep")
+        severity = normalize_severity(result["extra"]["severity"], scanner="semgrep")
+
+        # Semgrep registry rules often carry a confidence rating in
+        # metadata; use it when present to sharpen the priority score.
+        confidence = metadata.get("confidence")
+
+        priority = compute_cwe_priority(severity=severity, cwe=cwe, confidence=confidence)
+
+        findings.append({
+            "title": result["check_id"].split(".")[-1],
+            "severity": severity,
+            "file": result["path"],
+            "line": start_line,
+            "description": result["extra"]["message"],
+            "rule": result["check_id"],
+            "cwe": cwe,
+            "owasp": owasp,
+            "scanner": "semgrep",
+            # SAST findings are pattern matches, not published vulnerabilities —
+            # there is no CVE to key an EPSS score off, so this is legitimately N/A.
+            "cve": "N/A",
+            "epss_score": "N/A",
+            "epss_percentile": "N/A",
+            "epss_risk_level": "LOW",
+            "iso27001_control": iso["id"],
+            "iso27001_control_name": iso["name"],
+            "iso27001_description": iso["description"],
+            "code_context": get_code_context(result["path"], start_line, end_line),
+            **priority,
+        })
+
+    return findings

@@ -16,6 +16,7 @@ import {
   GitBranch,
   ScrollText,
   Settings,
+  Plug,
 } from "lucide-react";
 import {
   Sidebar,
@@ -48,6 +49,7 @@ const workspace = [
   { title: "Reports", url: "/dashboard/reports", icon: FileText },
   { title: "Pipeline", url: "/dashboard/pipeline", icon: GitBranch },
   { title: "Compliance", url: "/dashboard/compliance", icon: ScrollText },
+  { title: "Integrations", url: "/dashboard/integrations", icon: Plug },
   { title: "Settings", url: "/dashboard/settings", icon: Settings },
 ];
 

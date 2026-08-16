@@ -17,11 +17,18 @@ Required environment values: `SUPABASE_URL`, `SUPABASE_ANON_KEY`,
 `INTEGRATIONS_ENCRYPTION_KEY`. Generate the last one once with
 `Fernet.generate_key().decode()` and keep it in the secret manager.
 
+In production this service is mounted at `/integrations` inside the main
+SecureFlow backend (`backend/main.py`) rather than run as the separate
+process shown above — same process/port, still fully isolated tables. Set
+`INTEGRATIONS_FRONTEND_URL` (the dashboard's origin, e.g.
+`https://app.example.com`) so the GitHub/GitLab OAuth callbacks redirect
+the browser back to `{INTEGRATIONS_FRONTEND_URL}/dashboard/integrations`
+instead of returning raw JSON. Without it, callbacks just return JSON,
+which is still fine for calling the API directly.
+
 GitHub OAuth also needs `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and
 `GITHUB_REDIRECT_URI`. The callback exchanges an OAuth code, stores the
-token encrypted, and returns only connection metadata.
-
-GitLab OAuth needs `GITLAB_CLIENT_ID`, `GITLAB_CLIENT_SECRET`, and
+token encrypted, and returns only connection metadata.GitLab OAuth needs `GITLAB_CLIENT_ID`, `GITLAB_CLIENT_SECRET`, and
 `GITLAB_REDIRECT_URI`. It targets gitlab.com by default; set `GITLAB_URL`
 to point at a self-hosted instance instead. The flow is identical to
 GitHub's, just under the `/gitlab/...` paths:
@@ -43,9 +50,14 @@ GitHub flow:
    `GET /organizations/{organization_id}/integrations/{integration_id}/github/repositories`
    and save a verified selection with `PUT .../github/repository`.
 
-Repository selection is stored as connection metadata only. It deliberately
-does not invoke SecureFlow's legacy scanner until the deployment has chosen a
-safe, authenticated scan-handoff adapter for private repositories.
+Repository selection is stored as connection metadata only. Scanning a
+selected repository is a separate, explicit step:
+`POST .../integrations/{integration_id}/github/scan` (or `.../gitlab/scan`)
+clones it with the stored OAuth token — safe for private repos — runs the
+same SAST (Semgrep), SCA (Trivy), and secret-detection scanners the legacy
+routes use, and persists findings through the existing pipeline. The token
+is embedded in the git URL only for the lifetime of that one `git clone`
+subprocess call and is never logged.
 
 ## Container registries
 
