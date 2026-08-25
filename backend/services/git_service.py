@@ -42,11 +42,12 @@ def build_authenticated_url(clone_url: str, token: str, provider: str) -> str:
     Only ever used in-process to build the argument passed to `git clone`
     for this one subprocess call — never logged, never persisted, never
     returned to a caller. GitHub accepts any non-empty username with the
-    token as the password; GitLab's convention is the `oauth2` username.
+    token as the password; GitLab's convention is the `oauth2` username;
+    Bitbucket's OAuth access tokens use the `x-token-auth` username.
     """
     if not clone_url.startswith("https://"):
         raise ValueError("Authenticated clone requires an https:// URL")
-    username = "oauth2" if provider == "gitlab" else "x-access-token"
+    username = {"gitlab": "oauth2", "bitbucket": "x-token-auth"}.get(provider, "x-access-token")
     return clone_url.replace("https://", f"https://{username}:{token}@", 1)
 
 
@@ -75,7 +76,7 @@ def clone_repo(repo_url: str, *, log_url: str | None = None):
             timeout=_CLONE_TIMEOUT_SECS,
             capture_output=True,
         )
-    except subprocess.TimeoutExpired as exc:
+    except subprocess.TimeoutExpired:
         cleanup_repo(temp_dir)
         raise RuntimeError(
             f"git clone of {safe_url} did not finish within {_CLONE_TIMEOUT_SECS}s "

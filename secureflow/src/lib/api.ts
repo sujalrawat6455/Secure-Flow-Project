@@ -125,6 +125,14 @@ export type ApiApiKey = {
   revoked_at?: string | null;
 };
 
+export type ApiBlockingFinding = {
+  id: string | number;
+  title?: string;
+  severity?: string;
+  scanner?: string;
+  file?: string;
+};
+
 /* ── Integrations + access control ─────────────────────────────────── */
 
 export type ApiOrgRole = "owner" | "admin" | "security" | "viewer";
@@ -136,6 +144,14 @@ export type ApiOrganization = {
   created_at: string;
 };
 
+/** One row of GET /integrations/organizations — an org this user belongs
+ * to, plus their role in it. Backs the "Switch organization" picker. */
+export type ApiMyOrganization = {
+  id: number;
+  name: string;
+  role: ApiOrgRole;
+};
+
 export type ApiOrgMember = {
   organization_id: number;
   user_id: string;
@@ -145,7 +161,7 @@ export type ApiOrgMember = {
 export type ApiIntegration = {
   id: number;
   organization_id: number;
-  provider: "github" | "gitlab" | "dockerhub" | "ecr" | "ghcr";
+  provider: "github" | "gitlab" | "bitbucket" | "dockerhub" | "ecr" | "ghcr";
   name: string;
   metadata: Record<string, unknown>;
   status: "connected" | "revoked";
@@ -179,14 +195,6 @@ export type ApiOrgApiKey = {
   revoked_at?: string | null;
 };
 
-export type ApiBlockingFinding = {
-  id: string | number;
-  title?: string;
-  severity?: string;
-  scanner?: string;
-  file?: string;
-};
-
 function qs(params: Record<string, unknown>) {
   const sp = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
@@ -203,6 +211,24 @@ function qs(params: Record<string, unknown>) {
 async function getAccessToken(): Promise<string | null> {
   const { data } = await supabase.auth.getSession();
   return data.session?.access_token ?? null;
+}
+
+/**
+ * Error carrying the HTTP status so callers can react to specific failures
+ * (e.g. a 403 on an org-scoped route means the selected org is stale and
+ * must be dropped rather than retried).
+ */
+export class ApiHttpError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiHttpError";
+    this.status = status;
+  }
+}
+
+export function isForbidden(e: unknown): boolean {
+  return e instanceof ApiHttpError && (e.status === 403 || e.status === 404);
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -229,7 +255,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
         (data as { detail: unknown }).detail) ||
       res.statusText ||
       "Request failed";
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    throw new ApiHttpError(
+      typeof detail === "string" ? detail : JSON.stringify(detail),
+      res.status,
+    );
   }
   return data as T;
 }
@@ -290,7 +319,9 @@ async function requestBlob(path: string, init: RequestInit = {}): Promise<Blob> 
 
 export type ScanResponse = { scan_id?: string | number; [k: string]: unknown };
 /** DAST is full-assessment only in this product — no depth choice. */
-export type DastMode = "full";
+export type DastMode = "quick" | "standard" | "full";
+/** Active scan attack strength: independent of the DAST scan_mode profile. */
+export type DastAttackStrength = "LOW" | "MEDIUM" | "HIGH" | "INSANE";
 
 /**
  * POST /api/dast/scan returns immediately (it does not block for the scan's
@@ -298,19 +329,39 @@ export type DastMode = "full";
  */
 export type DastScanStartResponse = {
   scan_id: number;
-  status: "running";
+  status: "queued" | "running";
   target_url: string;
   scan_mode: DastMode;
+  attack_strength?: DastAttackStrength;
+  /** True when another scan holds the scanner and this one is queued behind it. */
+  scanner_busy?: boolean;
 };
 
 /** Shape returned by GET /api/dast/scan/{scan_id} while polling. */
 export type DastScanStatusResponse = {
   scan_id: number;
-  status: "running" | "completed" | "failed";
+  status: "queued" | "running" | "completed" | "failed" | "cancelled" | "timed_out";
   started_at?: string | null;
   finished_at?: string | null;
   progress_phase?: string | null;
   progress_pct?: number | null;
+  /** AJAX spider outcome for Full scans; null until it has run. */
+  ajax_spider_status?: "completed" | "timed_out" | "failed_to_start" | null;
+  /** e.g. "53/53 rules configured" or "47/53 rules configured (degraded)". */
+  scanner_coverage?: string | null;
+  cancel_requested?: boolean;
+  /** Present on timed_out responses: findings are partial. */
+  partial_results?: boolean;
+  scan_mode?: DastMode | string | null;
+  /**
+   * Real-time ZAP active-scan telemetry, present only while status="running"
+   * during the active scan phase. Any field may be null when ZAP has not
+   * reported it yet.
+   */
+  active_scan_requests?: number | null;
+  active_scan_progress?: number | null;
+  active_scan_state?: string | null;
+  active_scan_alerts?: number | null;
   findings?: ApiFinding[];
   error?: string;
 };
@@ -358,13 +409,23 @@ export const api = {
    * NOT wait for the scan to finish. Poll getDastScanStatus() with the
    * returned scan_id until status is "completed" or "failed".
    */
-  scanDast: (target_url: string, scan_mode: DastMode = "full") =>
+  scanDast: (
+    target_url: string,
+    scan_mode: DastMode = "full",
+    attack_strength: DastAttackStrength = "MEDIUM",
+  ) =>
     request<DastScanStartResponse>("/api/dast/scan", {
       method: "POST",
-      body: JSON.stringify({ target_url, scan_mode }),
+      body: JSON.stringify({ target_url, scan_mode, attack_strength }),
     }),
   getDastScanStatus: (scanId: string | number) =>
     request<DastScanStatusResponse>(`/api/dast/scan/${scanId}`),
+  /** Cooperative cancel — returns 409 if the scan already reached a terminal state. */
+  cancelDastScan: (scanId: string | number) =>
+    request<{ scan_id: number; status: string; cancel_requested?: boolean }>(
+      `/api/dast/scan/${scanId}/cancel`,
+      { method: "POST" },
+    ),
 
   reportPdf: (scanId: string | number) => requestBlob(`/api/reports/${scanId}/pdf`),
 
@@ -402,6 +463,20 @@ export const api = {
     request<ApiOrganization>("/integrations/organizations", {
       method: "POST",
       body: JSON.stringify({ name }),
+    }),
+  /** Organizations the signed-in user belongs to, each with their role —
+   * backs the "Switch organization" picker. */
+  listMyOrganizations: () =>
+    request<{ organizations: ApiMyOrganization[] }>("/integrations/organizations"),
+  /**
+   * Deletes an organization and everything scoped to it (integrations, org
+   * API keys, memberships). The backend is expected to enforce that only an
+   * owner/admin may do this and to answer 403 otherwise — the UI only hides
+   * the affordance, it is not the authority.
+   */
+  deleteOrganization: (organizationId: number) =>
+    request<{ deleted: boolean }>(`/integrations/organizations/${organizationId}`, {
+      method: "DELETE",
     }),
   upsertMember: (organizationId: number, userId: string, role: ApiOrgRole) =>
     request<ApiOrgMember>(`/integrations/organizations/${organizationId}/members`, {
@@ -454,6 +529,25 @@ export const api = {
   scanGitlabRepository: (organizationId: number, integrationId: number) =>
     request<{ repository: ApiRepository; findings: unknown[] }>(
       `/integrations/organizations/${organizationId}/integrations/${integrationId}/gitlab/scan`,
+      { method: "POST" },
+    ),
+
+  bitbucketAuthorize: (organizationId: number) =>
+    request<{ authorize_url: string }>(
+      `/integrations/bitbucket/authorize?organization_id=${organizationId}`,
+    ),
+  bitbucketRepositories: (organizationId: number, integrationId: number) =>
+    request<{ repositories: ApiRepository[] }>(
+      `/integrations/organizations/${organizationId}/integrations/${integrationId}/bitbucket/repositories`,
+    ),
+  selectBitbucketRepository: (organizationId: number, integrationId: number, fullName: string) =>
+    request<{ integration: ApiIntegration; repository: ApiRepository }>(
+      `/integrations/organizations/${organizationId}/integrations/${integrationId}/bitbucket/repository`,
+      { method: "PUT", body: JSON.stringify({ full_name: fullName }) },
+    ),
+  scanBitbucketRepository: (organizationId: number, integrationId: number) =>
+    request<{ repository: ApiRepository; findings: unknown[] }>(
+      `/integrations/organizations/${organizationId}/integrations/${integrationId}/bitbucket/scan`,
       { method: "POST" },
     ),
 

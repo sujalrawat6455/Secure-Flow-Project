@@ -11,7 +11,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from services.auth_service import get_current_user_id
+from services.auth_service import require_scope
 from services.db_service import (
     delete_all_findings,
     delete_all_workspace_data,
@@ -32,7 +32,7 @@ def get_findings(
     q: str | None = Query(default=None, description="Free-text search across id, title, project name, and scanner -- matched server-side across ALL findings, not just the current page."),
     limit: int | None = Query(default=None, description="Cap the number of rows returned, most recent first. Omit for no limit."),
     offset: int = Query(default=0, ge=0, description="Rows to skip, for paging through results beyond `limit`."),
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_scope("findings:read")),
 ):
     findings, total = list_findings(
         user_id,
@@ -51,7 +51,7 @@ def get_findings(
 def clear_findings(
     project_id: int | None = Query(default=None, description="Only clear findings for this project"),
     scanner: str | None = Query(default=None, description="Only clear findings from this scanner"),
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_scope("projects:write")),
 ):
     """Deletes findings rows so the dashboard doesn't keep growing unbounded
     across repeated test scans. Scan/project history is left intact —
@@ -69,7 +69,7 @@ def clear_findings(
 
 @router.delete("/all")
 def clear_all_workspace_data(
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_scope("projects:write")),
 ):
     """Completely reset the authenticated user's SecureFlow workspace.
 

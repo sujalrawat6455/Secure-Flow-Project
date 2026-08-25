@@ -17,6 +17,14 @@ Required environment values: `SUPABASE_URL`, `SUPABASE_ANON_KEY`,
 `INTEGRATIONS_ENCRYPTION_KEY`. Generate the last one once with
 `Fernet.generate_key().decode()` and keep it in the secret manager.
 
+> **If `sf_integrations` already exists in your database** (i.e. you ran
+> this service before Bitbucket support was added), `store.initialize()`'s
+> `CREATE TABLE IF NOT EXISTS` is a no-op on it and won't add `'bitbucket'`
+> to the `provider` CHECK constraint. Run once, by hand:
+> `ALTER TABLE sf_integrations DROP CONSTRAINT sf_integrations_provider_check, ADD CONSTRAINT sf_integrations_provider_check CHECK (provider IN ('github','gitlab','bitbucket','dockerhub','ecr','ghcr'));`
+> (constraint name may differ — check with `\d sf_integrations` in psql first).
+> A brand-new database needs no action; the constraint is already correct.
+
 In production this service is mounted at `/integrations` inside the main
 SecureFlow backend (`backend/main.py`) rather than run as the separate
 process shown above — same process/port, still fully isolated tables. Set
@@ -28,7 +36,9 @@ which is still fine for calling the API directly.
 
 GitHub OAuth also needs `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and
 `GITHUB_REDIRECT_URI`. The callback exchanges an OAuth code, stores the
-token encrypted, and returns only connection metadata.GitLab OAuth needs `GITLAB_CLIENT_ID`, `GITLAB_CLIENT_SECRET`, and
+token encrypted, and returns only connection metadata.
+
+GitLab OAuth needs `GITLAB_CLIENT_ID`, `GITLAB_CLIENT_SECRET`, and
 `GITLAB_REDIRECT_URI`. It targets gitlab.com by default; set `GITLAB_URL`
 to point at a self-hosted instance instead. The flow is identical to
 GitHub's, just under the `/gitlab/...` paths:
@@ -37,7 +47,17 @@ GitHub's, just under the `/gitlab/...` paths:
 2. `GET /gitlab/callback` verifies the one-time OAuth state, exchanges the code, and stores the token encrypted.
 3. `GET /organizations/{organization_id}/integrations/{integration_id}/gitlab/repositories` lists accessible projects; `PUT .../gitlab/repository` saves a verified selection (`full_name` = GitLab's `namespace/path`).
 
-Bitbucket is intentionally not exposed yet.
+Bitbucket OAuth needs `BITBUCKET_CLIENT_ID`, `BITBUCKET_CLIENT_SECRET`, and
+`BITBUCKET_REDIRECT_URI`. Bitbucket Cloud only (api.bitbucket.org) — create
+the OAuth consumer under the workspace's **Settings → OAuth consumers**
+(not a personal account setting, unlike GitHub/GitLab), with the callback
+URL set to this service's `/bitbucket/callback` and the **Account** +
+**Repositories: Read** permissions checked. Same flow, under `/bitbucket/...`:
+
+1. `GET /bitbucket/authorize?organization_id=...` → send the browser to `authorize_url`.
+2. `GET /bitbucket/callback` verifies the one-time OAuth state, exchanges the code, and stores the token encrypted.
+3. `GET /organizations/{organization_id}/integrations/{integration_id}/bitbucket/repositories` lists accessible repos (across all workspaces the token can see); `PUT .../bitbucket/repository` saves a verified selection (`full_name` = Bitbucket's `workspace/repo_slug`).
+4. `POST .../integrations/{integration_id}/bitbucket/scan` scans it, same as GitHub/GitLab.
 
 GitHub flow:
 
@@ -52,12 +72,12 @@ GitHub flow:
 
 Repository selection is stored as connection metadata only. Scanning a
 selected repository is a separate, explicit step:
-`POST .../integrations/{integration_id}/github/scan` (or `.../gitlab/scan`)
-clones it with the stored OAuth token — safe for private repos — runs the
-same SAST (Semgrep), SCA (Trivy), and secret-detection scanners the legacy
-routes use, and persists findings through the existing pipeline. The token
-is embedded in the git URL only for the lifetime of that one `git clone`
-subprocess call and is never logged.
+`POST .../integrations/{integration_id}/github/scan` (or `.../gitlab/scan`,
+`.../bitbucket/scan`) clones it with the stored OAuth token — safe for
+private repos — runs the same SAST (Semgrep), SCA (Trivy), and secret-
+detection scanners the legacy routes use, and persists findings through the
+existing pipeline. The token is embedded in the git URL only for the
+lifetime of that one `git clone` subprocess call and is never logged.
 
 ## Container registries
 
@@ -93,3 +113,47 @@ touching or duplicating that code. `run_container_scan` gained an optional
 `env` parameter for this; callers that don't pass it are unaffected.
 
 ECR support requires `boto3` (see `requirements.txt`).
+
+## API keys — creation vs. authentication
+
+Creating, listing, and revoking organization-scoped keys (`POST/GET/DELETE
+.../organizations/{organization_id}/api-keys`) lives entirely in this
+service. Actually *authenticating a request* with one of those keys does
+not — that happens once, centrally, in `services/auth_service.py`, so both
+this service's own routes and every legacy `routes/*.py` endpoint accept
+the same keys the same way.
+
+A caller sends `X-API-Key: sfk_...` instead of `Authorization: Bearer
+<supabase token>`. `services.auth_service._resolve_principal` hashes it and
+checks two places, in order:
+
+1. `sf_api_keys` (this service's org-scoped keys, via
+   `store.find_api_key_by_hash`) — if found and not revoked, the request
+   is scoped to exactly that key's `scopes` list, and `last_used_at` is
+   updated.
+2. The legacy per-user `api_keys` table (`services.db_service
+   .get_user_id_for_api_key`) — unscoped, full access as the user who
+   created it, kept for backward compatibility with keys issued before
+   organizations existed.
+
+Routes opt into scope enforcement by depending on
+`services.auth_service.require_scope("scope:name")` instead of the plain
+`get_current_user_id`. A dashboard session or a legacy key is always
+unrestricted (`require_scope` behaves like `get_current_user_id` for
+those); an org-scoped key must have that exact scope (or the owner
+role's `"*"` wildcard, though only human org roles ever get `"*"` — keys
+are created with an explicit scope list, never `"*"`) or the request is
+rejected with 403. Every scan-triggering, findings, projects, reports,
+and gate route in `routes/*.py` has been switched to `require_scope(...)`
+using the same permission vocabulary as `integrations/permissions.py`
+(`projects:read`, `projects:write`, `scans:read`, `scans:run`,
+`findings:read`, `reports:read`).
+
+Note this is scope-based, not organization-role-based: an org-scoped
+key's *scopes* are checked, but the legacy resources it acts on
+(projects/scans/findings owned by `created_by`) aren't themselves tied to
+an organization or filtered by the caller's organization role. Full
+organization-scoped data isolation over the legacy tables (e.g. "this
+project belongs to org X, only members of org X may ever see it,
+regardless of key") would need `organization_id` added to the legacy
+`projects` table and is not implemented here.

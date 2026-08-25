@@ -9,7 +9,7 @@ from scanners.zap_runner import (
     ZapScanError,
     run_zap_scan,
 )
-from services.auth_service import get_current_user_id
+from services.auth_service import require_scope
 from services.db_service import (
     create_scan,
     finish_scan,
@@ -109,7 +109,7 @@ def _run_dast_scan_background(user_id: str, project_id: int, scan_id: int, targe
 
 
 @router.post("/api/dast/scan")
-def scan_dast(request: DastScanRequest, user_id: str = Depends(get_current_user_id)):
+def scan_dast(request: DastScanRequest, user_id: str = Depends(require_scope("scans:run"))):
     """
     Kicks off a DAST scan against a running web application and returns
     immediately with a scan_id — it does NOT wait for the scan to finish.
@@ -147,7 +147,7 @@ def scan_dast(request: DastScanRequest, user_id: str = Depends(get_current_user_
 
 
 @router.get("/api/dast/scan/{scan_id}")
-def get_dast_scan_status(scan_id: int, user_id: str = Depends(get_current_user_id)):
+def get_dast_scan_status(scan_id: int, user_id: str = Depends(require_scope("scans:read"))):
     """
     Poll this while a scan is running. Short-lived request by design — safe
     to call every few seconds even over a flaky tunnel, unlike waiting on

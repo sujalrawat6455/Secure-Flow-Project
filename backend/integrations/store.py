@@ -40,7 +40,7 @@ def initialize() -> None:
             );
             CREATE TABLE IF NOT EXISTS sf_integrations (
               id BIGSERIAL PRIMARY KEY, organization_id BIGINT NOT NULL REFERENCES sf_organizations(id) ON DELETE CASCADE,
-              provider TEXT NOT NULL CHECK (provider IN ('github','gitlab','dockerhub','ecr','ghcr')),
+              provider TEXT NOT NULL CHECK (provider IN ('github','gitlab','bitbucket','dockerhub','ecr','ghcr')),
               name TEXT NOT NULL, encrypted_credentials TEXT NOT NULL,
               metadata JSONB NOT NULL DEFAULT '{}'::jsonb, status TEXT NOT NULL DEFAULT 'connected',
               created_by TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), revoked_at TIMESTAMPTZ
@@ -59,6 +59,19 @@ def initialize() -> None:
               created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
         """)
+        # CREATE TABLE IF NOT EXISTS above is a no-op on a table that
+        # already exists — so on any database that had sf_integrations
+        # created before 'bitbucket' was added as a provider, the CHECK
+        # constraint above never actually took effect, and every Bitbucket
+        # connect attempt fails with an unhandled CheckViolation (a 500).
+        # This makes that self-healing: drop-and-recreate the constraint
+        # every startup so it always matches the provider list above,
+        # regardless of how old the table is. Cheap and safe to repeat.
+        cur.execute("""
+            ALTER TABLE sf_integrations DROP CONSTRAINT IF EXISTS sf_integrations_provider_check;
+            ALTER TABLE sf_integrations ADD CONSTRAINT sf_integrations_provider_check
+              CHECK (provider IN ('github','gitlab','bitbucket','dockerhub','ecr','ghcr'));
+        """)
 
 
 def create_organization(name: str, owner_user_id: str) -> dict:
@@ -74,6 +87,19 @@ def role_for(organization_id: int, user_id: str) -> str | None:
         cur.execute("SELECT role FROM sf_organization_members WHERE organization_id=%s AND user_id=%s", (organization_id, user_id))
         row = cur.fetchone()
         return row["role"] if row else None
+
+
+def list_organizations_for_user(user_id: str) -> list[dict]:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT o.id, o.name, m.role
+               FROM sf_organizations o
+               JOIN sf_organization_members m ON m.organization_id = o.id
+               WHERE m.user_id = %s
+               ORDER BY o.created_at DESC""",
+            (user_id,),
+        )
+        return [dict(row) for row in cur.fetchall()]
 
 
 def add_member(organization_id: int, user_id: str, role: str) -> dict:
@@ -103,15 +129,6 @@ def revoke_integration(organization_id: int, integration_id: int) -> bool:
 
 
 def get_active_integration(organization_id: int, integration_id: int, provider: str | tuple[str, ...] | None) -> dict | None:
-    """Return one active integration, including its encrypted secret.
-
-    ``provider`` may be a single provider name, a tuple of acceptable
-    providers, or ``None`` to accept any provider.
-
-    This is intentionally private to server-side provider adapters. Route
-    responses must use ``list_integrations`` instead so secrets never leave
-    the service.
-    """
     provider_filter = ""
     params: tuple = (integration_id, organization_id)
     if provider is not None:
@@ -153,12 +170,6 @@ def put_oauth_state(state_hash: str, organization_id: int, user_id: str) -> None
 
 
 def consume_oauth_state(state_hash: str) -> dict | None:
-    """Consume a state exactly once, rejecting expired callbacks.
-
-    Shared across every OAuth-based provider (GitHub, GitLab, ...) — the
-    state token itself is opaque and random, so there's no need for a
-    separate table per provider.
-    """
     with db() as conn, conn.cursor() as cur:
         cur.execute(
             """DELETE FROM sf_oauth_states
@@ -181,6 +192,26 @@ def list_api_keys(organization_id: int) -> list[dict]:
     with db() as conn, conn.cursor() as cur:
         cur.execute("SELECT id,name,key_prefix,scopes,created_at,last_used_at,revoked_at FROM sf_api_keys WHERE organization_id=%s ORDER BY created_at DESC", (organization_id,))
         return [dict(row) for row in cur.fetchall()]
+
+
+def find_api_key_by_hash(key_hash: str) -> dict | None:
+    """Looks up an org-scoped API key by its hash for authentication —
+    the counterpart to services.db_service.get_user_id_for_api_key for the
+    legacy per-user keys. Returns revoked keys too (callers must check
+    `revoked_at` themselves) so a revoked key can be told apart from one
+    that never existed."""
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id,organization_id,scopes,created_by,revoked_at FROM sf_api_keys WHERE key_hash=%s",
+            (key_hash,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def touch_api_key(key_id: int) -> None:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE sf_api_keys SET last_used_at=now() WHERE id=%s", (key_id,))
 
 
 def revoke_api_key(organization_id: int, key_id: int) -> bool:

@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
@@ -41,8 +41,22 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import { api, type ApiIntegration, type ApiOrgRole } from "@/lib/api";
+import {
+  api,
+  isForbidden,
+  type ApiIntegration,
+  type ApiMyOrganization,
+  type ApiOrgRole,
+  type ApiRepository,
+} from "@/lib/api";
+import {
+  clearOrganizationState,
+  normalizeOrgId,
+  readStoredOrgId,
+  writeStoredOrgId,
+} from "@/lib/organization";
 import { useAuth } from "@/lib/auth";
+import { useIntegrationScan } from "@/lib/integrationScan";
 import {
   AlertTriangle,
   Building2,
@@ -50,6 +64,7 @@ import {
   Container,
   Github,
   GitBranch,
+  GitFork,
   KeyRound,
   Plug,
   Plus,
@@ -66,7 +81,6 @@ export const Route = createFileRoute("/dashboard/integrations")({
   component: IntegrationsPage,
 });
 
-const ORG_STORAGE_KEY = "secureflow.organization_id";
 const VALID_SCOPES = [
   "projects:read",
   "projects:write",
@@ -90,36 +104,179 @@ function errMsg(e: unknown) {
 
 /* ── Organization switcher / creation ────────────────────────────── */
 
-function useOrganizationId() {
-  const [organizationId, setOrganizationIdState] = useState<number | null>(() => {
-    const stored = localStorage.getItem(ORG_STORAGE_KEY);
-    return stored ? Number(stored) : null;
+const myOrganizationsQueryKey = ["my-organizations"] as const;
+
+function useMyOrganizations() {
+  return useQuery({
+    queryKey: myOrganizationsQueryKey,
+    queryFn: () => api.listMyOrganizations().then((r) => r.organizations),
+    staleTime: 15_000,
   });
-  const setOrganizationId = (id: number | null) => {
-    setOrganizationIdState(id);
-    if (id) localStorage.setItem(ORG_STORAGE_KEY, String(id));
-    else localStorage.removeItem(ORG_STORAGE_KEY);
-  };
-  return { organizationId, setOrganizationId };
+}
+
+function useOrganizationId() {
+  const [organizationId, setOrganizationIdState] = useState<number | null>(() => readStoredOrgId());
+  const setOrganizationId = useCallback((id: number | null) => {
+    const valid = normalizeOrgId(id);
+    setOrganizationIdState(valid);
+    writeStoredOrgId(valid);
+  }, []);
+  const clearOrganization = useCallback(() => {
+    setOrganizationIdState(null);
+    clearOrganizationState();
+  }, []);
+  return { organizationId, setOrganizationId, clearOrganization };
+}
+
+const ROLE_LABEL: Record<ApiOrgRole, string> = {
+  owner: "Owner",
+  admin: "Admin",
+  security: "Security",
+  viewer: "Viewer",
+};
+
+function MyOrganizationsList({
+  currentOrganizationId,
+  onPick,
+  onDeleted,
+}: {
+  currentOrganizationId: number | null;
+  onPick: (id: number) => void;
+  onDeleted: (id: number) => void;
+}) {
+  const qc = useQueryClient();
+  const myOrgs = useMyOrganizations();
+
+  const remove = useMutation({
+    mutationFn: (id: number) => api.deleteOrganization(id),
+    onSuccess: async (_r, id) => {
+      toast.success("Organization removed");
+      // Drop every cached org-scoped slice for the deleted org before the
+      // list refetches, so nothing re-requests it and 403s.
+      qc.removeQueries({ queryKey: ["integrations", id] });
+      qc.removeQueries({ queryKey: ["org-api-keys", id] });
+      qc.removeQueries({ queryKey: ["repositories"] });
+      qc.removeQueries({ queryKey: ["registry-images", id] });
+      onDeleted(id);
+      await qc.invalidateQueries({ queryKey: myOrganizationsQueryKey });
+    },
+    onError: (e) => toast.error("Could not remove organization", { description: errMsg(e) }),
+  });
+
+  if (myOrgs.isLoading) {
+    return <TableSkeleton rows={2} cols={1} />;
+  }
+  if (myOrgs.error) {
+    return <ErrorState error={myOrgs.error} />;
+  }
+  if (!myOrgs.data || myOrgs.data.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="space-y-1.5">
+      <Label className="text-[11px]">Your organizations</Label>
+      <div className="space-y-1.5">
+        {myOrgs.data.map((org: ApiMyOrganization) => {
+          const isCurrent = org.id === currentOrganizationId;
+          // Only owners/admins get the destructive affordance; the backend
+          // still enforces this, the UI just doesn't tease it.
+          const canManage = org.role === "owner" || org.role === "admin";
+          return (
+            <div
+              key={org.id}
+              className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-[13px] ${
+                isCurrent ? "border-primary/40 bg-primary/5" : "border-border/70 bg-secondary/25"
+              }`}
+            >
+              <button
+                type="button"
+                onClick={() => onPick(org.id)}
+                disabled={isCurrent}
+                className="flex min-w-0 flex-1 items-center gap-2 text-left disabled:cursor-default"
+              >
+                <span className="truncate">
+                  <span className="font-medium">{org.name}</span>{" "}
+                  <span className="text-[11px] text-muted-foreground">#{org.id}</span>
+                </span>
+                {isCurrent && <Badge className="shrink-0 text-[10px]">Current</Badge>}
+              </button>
+              <Badge variant="outline" className="shrink-0 text-[10px]">
+                {ROLE_LABEL[org.role]}
+              </Badge>
+              {canManage && (
+                <AlertDialog>
+                  <AlertDialogTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 shrink-0 text-critical"
+                      aria-label={`Remove ${org.name}`}
+                      disabled={remove.isPending}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  </AlertDialogTrigger>
+                  <AlertDialogContent>
+                    <AlertDialogHeader>
+                      <AlertDialogTitle>Remove “{org.name}”?</AlertDialogTitle>
+                      <AlertDialogDescription>
+                        This permanently removes organization #{org.id} along with its integrations,
+                        members and API keys.
+                        {isCurrent && " It is your currently selected organization."} This cannot be
+                        undone.
+                      </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                      <AlertDialogCancel>Cancel</AlertDialogCancel>
+                      <AlertDialogAction onClick={() => remove.mutate(org.id)}>
+                        Yes, remove it
+                      </AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 function OrganizationPanel({
   organizationId,
   onSelect,
+  onClear,
 }: {
   organizationId: number | null;
   onSelect: (id: number) => void;
+  onClear: () => void;
 }) {
   const [name, setName] = useState("");
+  // Switching starts true whenever there's no active org yet, so the
+  // picker/create form shows by default. "Switch organization" flips it
+  // back on without ever setting organizationId to a sentinel value —
+  // that's what used to make the whole page appear to just disappear.
+  const [switching, setSwitching] = useState(organizationId === null);
+
   const create = useMutation({
     mutationFn: () => api.createOrganization(name.trim()),
     onSuccess: (org) => {
       toast.success(`Organization "${org.name}" created`);
+      setSwitching(false);
       onSelect(org.id);
       setName("");
     },
     onError: (e) => toast.error("Could not create organization", { description: errMsg(e) }),
   });
+
+  const pick = (id: number) => {
+    setSwitching(false);
+    onSelect(id);
+  };
+
+  const showPicker = organizationId === null || switching;
 
   return (
     <Panel
@@ -127,7 +284,7 @@ function OrganizationPanel({
       description="Every integration, role, and API key belongs to an organization."
       className="lg:col-span-2"
     >
-      {organizationId ? (
+      {!showPicker && organizationId ? (
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border/70 bg-secondary/25 p-4">
           <div>
             <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
@@ -135,37 +292,62 @@ function OrganizationPanel({
             </div>
             <div className="mt-1 text-[13px] font-medium">#{organizationId}</div>
           </div>
-          <Button variant="outline" size="sm" onClick={() => onSelect(0)}>
+          <Button variant="outline" size="sm" onClick={() => setSwitching(true)}>
             Switch organization
           </Button>
         </div>
       ) : (
-        <div className="space-y-3">
-          <p className="text-[13px] text-muted-foreground">
-            Create an organization to connect source control, registries, and manage access. You
-            become its Owner automatically.
-          </p>
-          <div className="flex gap-2">
-            <Input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. Acme Security"
-              className="h-9 max-w-xs text-[13px]"
-            />
-            <Button
-              size="sm"
-              disabled={create.isPending || !name.trim()}
-              onClick={() => create.mutate()}
-            >
-              <Plus className="h-3.5 w-3.5" />{" "}
-              {create.isPending ? "Creating…" : "Create organization"}
-            </Button>
+        <div className="space-y-4">
+          {organizationId !== null && (
+            <div className="flex items-center justify-between">
+              <p className="text-[12px] text-muted-foreground">
+                Pick an organization below, or create a new one.
+              </p>
+              <Button variant="ghost" size="sm" onClick={() => setSwitching(false)}>
+                Cancel
+              </Button>
+            </div>
+          )}
+
+          <MyOrganizationsList
+            currentOrganizationId={organizationId}
+            onPick={pick}
+            onDeleted={(id) => {
+              // Only the active selection is affected; other orgs stay put.
+              if (id === organizationId) {
+                onClear();
+                setSwitching(true);
+              }
+            }}
+          />
+
+          <div className="space-y-3 border-t border-border/50 pt-4">
+            <p className="text-[13px] text-muted-foreground">
+              Create an organization to connect source control, registries, and manage access. You
+              become its Owner automatically.
+            </p>
+            <div className="flex gap-2">
+              <Input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="e.g. Acme Security"
+                className="h-9 max-w-xs text-[13px]"
+              />
+              <Button
+                size="sm"
+                disabled={create.isPending || !name.trim()}
+                onClick={() => create.mutate()}
+              >
+                <Plus className="h-3.5 w-3.5" />{" "}
+                {create.isPending ? "Creating…" : "Create organization"}
+              </Button>
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              Already have an organization ID from a teammate? Ask them to add you as a member, then
+              enter it below.
+            </p>
+            <OrgIdEntry onSelect={pick} />
           </div>
-          <p className="text-[11px] text-muted-foreground">
-            Already have an organization ID from a teammate? Ask them to add you as a member, then
-            enter it below.
-          </p>
-          <OrgIdEntry onSelect={onSelect} />
         </div>
       )}
     </Panel>
@@ -185,8 +367,11 @@ function OrgIdEntry({ onSelect }: { onSelect: (id: number) => void }) {
       <Button
         variant="outline"
         size="sm"
-        disabled={!raw.trim() || Number.isNaN(Number(raw))}
-        onClick={() => onSelect(Number(raw))}
+        disabled={normalizeOrgId(raw) === null}
+        onClick={() => {
+          const id = normalizeOrgId(raw);
+          if (id) onSelect(id);
+        }}
       >
         Use this org
       </Button>
@@ -195,13 +380,6 @@ function OrgIdEntry({ onSelect }: { onSelect: (id: number) => void }) {
 }
 
 /* ── Members / roles ─────────────────────────────────────────────── */
-
-const ROLE_LABEL: Record<ApiOrgRole, string> = {
-  owner: "Owner",
-  admin: "Admin",
-  security: "Security",
-  viewer: "Viewer",
-};
 
 function MembersPanel({ organizationId }: { organizationId: number }) {
   const [userId, setUserId] = useState("");
@@ -272,12 +450,65 @@ function MembersPanel({ organizationId }: { organizationId: number }) {
   );
 }
 
-/* ── Source control: GitHub + GitLab ─────────────────────────────── */
+/* ── Source control: GitHub + GitLab + Bitbucket ─────────────────── */
 
-function useIntegrations(organizationId: number) {
+type SourceProvider = "github" | "gitlab" | "bitbucket";
+
+const SOURCE_PROVIDER_CONFIG: Record<
+  SourceProvider,
+  {
+    label: string;
+    icon: typeof Github;
+    description: string;
+    authorize: (organizationId: number) => Promise<{ authorize_url: string }>;
+    listRepositories: (
+      organizationId: number,
+      integrationId: number,
+    ) => Promise<{ repositories: ApiRepository[] }>;
+    selectRepository: (
+      organizationId: number,
+      integrationId: number,
+      fullName: string,
+    ) => Promise<{ integration: ApiIntegration; repository: ApiRepository }>;
+  }
+> = {
+  github: {
+    label: "GitHub",
+    icon: Github,
+    description: "Connect GitHub → OAuth → repository list → select repo → scan.",
+    authorize: api.githubAuthorize,
+    listRepositories: api.githubRepositories,
+    selectRepository: api.selectGithubRepository,
+  },
+  gitlab: {
+    label: "GitLab",
+    icon: GitBranch,
+    description: "Connect GitLab (gitlab.com or self-hosted) → authorize → pick a project → scan.",
+    authorize: api.gitlabAuthorize,
+    listRepositories: api.gitlabRepositories,
+    selectRepository: api.selectGitlabRepository,
+  },
+  bitbucket: {
+    label: "Bitbucket",
+    icon: GitFork,
+    description: "Connect Bitbucket Cloud → authorize → pick a repository → scan.",
+    authorize: api.bitbucketAuthorize,
+    listRepositories: api.bitbucketRepositories,
+    selectRepository: api.selectBitbucketRepository,
+  },
+};
+
+/**
+ * Only ever fires for a validated, positive organization ID — never for the
+ * old `?? 0` sentinel — and never retries a 403/404, which means the org is
+ * gone or the caller lost access rather than a transient failure.
+ */
+function useIntegrations(organizationId: number | null) {
   return useQuery({
-    queryKey: ["integrations", organizationId],
-    queryFn: () => api.listIntegrations(organizationId).then((r) => r.integrations),
+    queryKey: ["integrations", organizationId ?? 0],
+    queryFn: () => api.listIntegrations(organizationId!).then((r) => r.integrations),
+    enabled: organizationId !== null,
+    retry: (count, error) => !isForbidden(error) && count < 1,
     staleTime: 15_000,
   });
 }
@@ -288,17 +519,15 @@ function SourceControlProvider({
   integrations,
 }: {
   organizationId: number;
-  provider: "github" | "gitlab";
+  provider: SourceProvider;
   integrations: ApiIntegration[];
 }) {
   const qc = useQueryClient();
+  const config = SOURCE_PROVIDER_CONFIG[provider];
   const active = integrations.filter((i) => i.provider === provider && i.status === "connected");
 
   const connect = useMutation({
-    mutationFn: () =>
-      provider === "github"
-        ? api.githubAuthorize(organizationId)
-        : api.gitlabAuthorize(organizationId),
+    mutationFn: () => config.authorize(organizationId),
     onSuccess: (r) => {
       window.location.href = r.authorize_url;
     },
@@ -317,25 +546,21 @@ function SourceControlProvider({
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <p className="text-[12px] text-muted-foreground">
-          {provider === "github"
-            ? "Connect GitHub → authorize → pick a repository → scan."
-            : "Connect GitLab (gitlab.com or self-hosted) → authorize → pick a project → scan."}
-        </p>
+        <p className="text-[12px] text-muted-foreground">{config.description}</p>
         <Button
           size="sm"
           variant="hero"
           disabled={connect.isPending}
           onClick={() => connect.mutate()}
         >
-          <Plug className="h-3.5 w-3.5" /> Connect {provider === "github" ? "GitHub" : "GitLab"}
+          <Plug className="h-3.5 w-3.5" /> Connect {config.label}
         </Button>
       </div>
 
       {active.length === 0 ? (
         <EmptyState
-          icon={provider === "github" ? Github : GitBranch}
-          title={`No ${provider === "github" ? "GitHub" : "GitLab"} connection yet`}
+          icon={config.icon}
+          title={`No ${config.label} connection yet`}
           description="Connect to browse repositories and run scans without pasting credentials."
         />
       ) : (
@@ -363,26 +588,23 @@ function RepositoryCard({
 }: {
   organizationId: number;
   integration: ApiIntegration;
-  provider: "github" | "gitlab";
+  provider: SourceProvider;
   onDisconnect: () => void;
 }) {
   const qc = useQueryClient();
   const [browsing, setBrowsing] = useState(false);
+  const config = SOURCE_PROVIDER_CONFIG[provider];
 
   const repos = useQuery({
     queryKey: ["repositories", provider, organizationId, integration.id],
     queryFn: () =>
-      provider === "github"
-        ? api.githubRepositories(organizationId, integration.id).then((r) => r.repositories)
-        : api.gitlabRepositories(organizationId, integration.id).then((r) => r.repositories),
+      config.listRepositories(organizationId, integration.id).then((r) => r.repositories),
     enabled: browsing,
   });
 
   const select = useMutation({
     mutationFn: (fullName: string) =>
-      provider === "github"
-        ? api.selectGithubRepository(organizationId, integration.id, fullName)
-        : api.selectGitlabRepository(organizationId, integration.id, fullName),
+      config.selectRepository(organizationId, integration.id, fullName),
     onSuccess: () => {
       toast.success("Repository selected");
       setBrowsing(false);
@@ -391,17 +613,9 @@ function RepositoryCard({
     onError: (e) => toast.error("Could not select repository", { description: errMsg(e) }),
   });
 
-  const scan = useMutation({
-    mutationFn: () =>
-      provider === "github"
-        ? api.scanGithubRepository(organizationId, integration.id)
-        : api.scanGitlabRepository(organizationId, integration.id),
-    onSuccess: (r) =>
-      toast.success(
-        `Scan complete — ${r.findings.length} finding${r.findings.length === 1 ? "" : "s"}`,
-      ),
-    onError: (e) => toast.error("Scan failed", { description: errMsg(e) }),
-  });
+  // Runs through the shared background-scan context, so switching tabs mid
+  // scan keeps tracking it and coming back reconnects instead of restarting.
+  const scan = useIntegrationScan(provider, organizationId, integration.id);
 
   const selectedRepo = (
     integration.metadata as { selected_repository?: { full_name?: string; private?: boolean } }
@@ -454,12 +668,25 @@ function RepositoryCard({
             size="sm"
             variant="hero"
             className="ml-auto h-7 text-[11px]"
-            disabled={scan.isPending}
-            onClick={() => scan.mutate()}
+            disabled={scan.running !== null}
+            onClick={() => scan.start(selectedRepo.full_name ?? integration.name)}
           >
-            <ScanLine className="h-3.5 w-3.5" /> {scan.isPending ? "Scanning…" : "Scan"}
+            <ScanLine className="h-3.5 w-3.5" /> {scan.running ? "Scanning…" : "Scan"}
           </Button>
         </div>
+      )}
+      {scan.running && (
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          Scanning {scan.running.label} — keeps running while you browse other pages.
+        </p>
+      )}
+      {!scan.running && scan.result && (
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          Last scan: {scan.result.label} —{" "}
+          {scan.result.ok
+            ? `${scan.result.count} finding${scan.result.count === 1 ? "" : "s"}`
+            : "failed"}
+        </p>
       )}
 
       {browsing && (
@@ -674,14 +901,7 @@ function RegistryCard({
     enabled: browsing,
   });
 
-  const scan = useMutation({
-    mutationFn: () => api.scanRegistryImage(organizationId, integration.id),
-    onSuccess: (r) =>
-      toast.success(
-        `Scanned ${r.image} — ${r.findings.length} finding${r.findings.length === 1 ? "" : "s"}`,
-      ),
-    onError: (e) => toast.error("Scan failed", { description: errMsg(e) }),
-  });
+  const scan = useIntegrationScan("registry", organizationId, integration.id);
 
   const selectImage = useMutation({
     mutationFn: (repository: string) =>
@@ -748,12 +968,25 @@ function RegistryCard({
             size="sm"
             variant="hero"
             className="ml-auto h-7 text-[11px]"
-            disabled={scan.isPending}
-            onClick={() => scan.mutate()}
+            disabled={scan.running !== null}
+            onClick={() => scan.start(`${selected.repository}:${selected.tag ?? "latest"}`)}
           >
-            <ScanLine className="h-3.5 w-3.5" /> {scan.isPending ? "Scanning…" : "Scan"}
+            <ScanLine className="h-3.5 w-3.5" /> {scan.running ? "Scanning…" : "Scan"}
           </Button>
         </div>
+      )}
+      {scan.running && (
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          Scanning {scan.running.label} — keeps running while you browse other pages.
+        </p>
+      )}
+      {!scan.running && scan.result && (
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          Last scan: {scan.result.label} —{" "}
+          {scan.result.ok
+            ? `${scan.result.count} finding${scan.result.count === 1 ? "" : "s"}`
+            : "failed"}
+        </p>
       )}
 
       {browsing && (
@@ -802,7 +1035,9 @@ function OrgApiKeysPanel({ organizationId }: { organizationId: number }) {
   const keys = useQuery({
     queryKey: ["org-api-keys", organizationId],
     queryFn: () => api.listOrgApiKeys(organizationId).then((r) => r.keys),
+    retry: (count, error) => !isForbidden(error) && count < 1,
   });
+
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [scopes, setScopes] = useState<string[]>(["scans:run", "findings:read"]);
@@ -987,22 +1222,68 @@ function OrgApiKeysPanel({ organizationId }: { organizationId: number }) {
 
 function IntegrationsPage() {
   const { user } = useAuth();
-  const { organizationId, setOrganizationId } = useOrganizationId();
+  const qc = useQueryClient();
+  const { organizationId, setOrganizationId, clearOrganization } = useOrganizationId();
   const search = Route.useSearch();
 
   useEffect(() => {
     if (search?.connected) {
-      toast.success(`${search.connected === "github" ? "GitHub" : "GitLab"} connected`);
+      const label =
+        search.connected === "github"
+          ? "GitHub"
+          : search.connected === "gitlab"
+            ? "GitLab"
+            : "Bitbucket";
+      toast.success(`${label} connected`);
     } else if (search?.error) {
       toast.error("Connection failed", { description: search.error });
     }
   }, [search?.connected, search?.error]);
 
-  const integrationsQuery = useIntegrations(organizationId ?? 0);
+  // The organization list is the source of truth. Org-scoped requests wait
+  // for it, and the stored selection is re-validated every time it loads —
+  // including right after the OAuth callback, so a stale ID from a previous
+  // session can never be restored.
+  const myOrgs = useMyOrganizations();
+  const orgList = myOrgs.data;
+
+  useEffect(() => {
+    if (!orgList) return;
+    if (orgList.length === 0) {
+      if (organizationId !== null) clearOrganization();
+      return;
+    }
+    if (organizationId === null || !orgList.some((o) => o.id === organizationId)) {
+      setOrganizationId(orgList[0].id);
+    }
+  }, [orgList, organizationId, clearOrganization, setOrganizationId]);
+
+  const activeOrganizationId =
+    organizationId !== null && orgList?.some((o) => o.id === organizationId)
+      ? organizationId
+      : null;
+
+  const integrationsQuery = useIntegrations(activeOrganizationId);
+
+  // A 403 means the selection is no longer usable — drop it and reload the
+  // list once instead of hammering the same forbidden URL.
+  useEffect(() => {
+    if (!integrationsQuery.error || !isForbidden(integrationsQuery.error)) return;
+    toast.error("Organization no longer available", {
+      description: "Reloading your organizations.",
+    });
+    clearOrganization();
+    qc.removeQueries({ queryKey: ["integrations"] });
+    qc.removeQueries({ queryKey: ["org-api-keys"] });
+    qc.invalidateQueries({ queryKey: myOrganizationsQueryKey });
+  }, [integrationsQuery.error, clearOrganization, qc]);
+
   const integrations = useMemo(
-    () => (organizationId ? (integrationsQuery.data ?? []) : []),
-    [organizationId, integrationsQuery.data],
+    () => (activeOrganizationId ? (integrationsQuery.data ?? []) : []),
+    [activeOrganizationId, integrationsQuery.data],
   );
+
+  const organizationId_ = activeOrganizationId;
 
   return (
     <>
@@ -1012,11 +1293,19 @@ function IntegrationsPage() {
         description="Connect source control and container registries, and manage who on your team can do what."
       />
       <div className="grid gap-5 lg:grid-cols-2">
-        <OrganizationPanel organizationId={organizationId} onSelect={setOrganizationId} />
+        <OrganizationPanel
+          organizationId={organizationId_}
+          onSelect={setOrganizationId}
+          onClear={clearOrganization}
+        />
 
-        {organizationId ? (
+        {myOrgs.isLoading ? (
+          <Panel title="Organization" className="lg:col-span-2">
+            <TableSkeleton rows={2} cols={1} />
+          </Panel>
+        ) : organizationId_ ? (
           <>
-            <MembersPanel organizationId={organizationId} />
+            <MembersPanel organizationId={organizationId_} />
 
             <Panel
               title="Source control"
@@ -1036,18 +1325,28 @@ function IntegrationsPage() {
                     <TabsTrigger value="gitlab">
                       <GitBranch className="h-3.5 w-3.5" /> GitLab
                     </TabsTrigger>
+                    <TabsTrigger value="bitbucket">
+                      <GitFork className="h-3.5 w-3.5" /> Bitbucket
+                    </TabsTrigger>
                   </TabsList>
                   <TabsContent value="github" className="pt-4">
                     <SourceControlProvider
-                      organizationId={organizationId}
+                      organizationId={organizationId_}
                       provider="github"
                       integrations={integrations}
                     />
                   </TabsContent>
                   <TabsContent value="gitlab" className="pt-4">
                     <SourceControlProvider
-                      organizationId={organizationId}
+                      organizationId={organizationId_}
                       provider="gitlab"
+                      integrations={integrations}
+                    />
+                  </TabsContent>
+                  <TabsContent value="bitbucket" className="pt-4">
+                    <SourceControlProvider
+                      organizationId={organizationId_}
+                      provider="bitbucket"
                       integrations={integrations}
                     />
                   </TabsContent>
@@ -1059,9 +1358,9 @@ function IntegrationsPage() {
               </p>
             </Panel>
 
-            <RegistriesPanel organizationId={organizationId} integrations={integrations} />
+            <RegistriesPanel organizationId={organizationId_} integrations={integrations} />
 
-            <OrgApiKeysPanel organizationId={organizationId} />
+            <OrgApiKeysPanel organizationId={organizationId_} />
           </>
         ) : (
           <Panel title="Get started" className="lg:col-span-2">

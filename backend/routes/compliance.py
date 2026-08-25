@@ -18,7 +18,7 @@ harmless to include and saves a second round trip if that UI gets built.
 
 from fastapi import APIRouter, Depends, Query
 
-from services.auth_service import get_current_user_id
+from services.auth_service import require_scope
 from services.db_service import get_compliance_frameworks, get_compliance_summary
 
 router = APIRouter(prefix="/api/compliance", tags=["compliance"])
@@ -27,7 +27,7 @@ router = APIRouter(prefix="/api/compliance", tags=["compliance"])
 @router.get("")
 def get_compliance(
     project_id: int | None = Query(default=None),
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_scope("reports:read")),
 ):
     frameworks = get_compliance_frameworks(user_id, project_id=project_id)
     controls = get_compliance_summary(user_id, project_id=project_id)
