@@ -1,0 +1,62 @@
+"""
+parsers/secrets_parser.py
+Converts the secret-detection scanner's internal SecretFinding objects into
+the shared `Finding` shape used across SAST/SCA/IaC, so the frontend can
+treat all four scanners uniformly via the `scanner` field.
+"""
+
+from mappings.iso27001 import get_iso_control
+from secret_detection.scanner import ScanResult
+from services.priority_service import compute_cwe_priority
+from utils.severity import normalize_severity
+
+# Secret detection findings don't map to a single CWE — leave the mapping
+# loose but still meaningful where it clearly applies.
+_CWE_BY_RULE = {
+    "aws-access-key": "CWE-798",
+    "aws-secret-key": "CWE-798",
+    "github-token": "CWE-798",
+    "gitlab-token": "CWE-798",
+    "slack-token": "CWE-798",
+    "slack-webhook": "CWE-798",
+    "google-api-key": "CWE-798",
+    "stripe-key": "CWE-798",
+    "openai-key": "CWE-798",
+    "private-key-block": "CWE-798",
+    "jwt": "CWE-798",
+    "generic-api-key-assignment": "CWE-798",
+    "db-connection-string": "CWE-798",
+    "npm-token": "CWE-798",
+}
+
+
+def normalize_secret_findings(result: ScanResult):
+    findings = []
+
+    for f in result.findings:
+        cwe = _CWE_BY_RULE.get(f.rule_id, "CWE-798")
+        iso = get_iso_control(cwe=cwe, scanner="secrets")
+        severity = normalize_severity(f.severity.value, scanner="secrets")
+        # Entropy-based matches are inherently less certain than a known
+        # pattern (an AWS key regex) -- feed that into the priority score
+        # as a confidence signal rather than treating every hit the same.
+        confidence = "LOW" if f.rule_id == "entropy-generic" else "HIGH"
+        priority = compute_cwe_priority(severity=severity, cwe=cwe, confidence=confidence)
+
+        findings.append({
+            "title": f.rule_id,
+            "severity": severity,
+            "file": f.file_path,
+            "line": f.line,
+            "description": f.description + f" (matched: {f.match})",
+            "rule": f.rule_id,
+            "cwe": cwe,  # CWE-798: Use of Hard-coded Credentials
+            "owasp": "A02:2021",  # Cryptographic Failures — closest OWASP Top 10 bucket for exposed secrets
+            "scanner": "secrets",
+            "iso27001_control": iso["id"],
+            "iso27001_control_name": iso["name"],
+            "iso27001_description": iso["description"],
+            **priority,
+        })
+
+    return findings

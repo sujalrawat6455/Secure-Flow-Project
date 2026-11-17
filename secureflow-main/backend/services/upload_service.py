@@ -1,0 +1,169 @@
+import logging
+import os
+import shutil
+import tempfile
+import zipfile
+
+from services.git_service import _clear_readonly_and_retry
+
+logger = logging.getLogger(__name__)
+
+# Same fix as git_service.py — keep temp folders on the backend's own drive.
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_TMP_ROOT = os.path.join(_BASE_DIR, "..", "tmp_scans")
+os.makedirs(_TMP_ROOT, exist_ok=True)
+
+# Uploaded ZIPs are untrusted input with no size limit enforced before this
+# -- a small crafted archive could previously decompress to gigabytes (a
+# "zip bomb") and fill the VPS disk. Both limits are independently
+# configurable and generous by default; tighten them if your real repos
+# are much smaller than this.
+_MAX_ZIP_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_ZIP_MB", "200")) * 1024 * 1024
+_MAX_EXTRACTED_BYTES = int(os.environ.get("MAX_UPLOAD_EXTRACTED_MB", "1000")) * 1024 * 1024
+
+
+def _copy_within_budget(src, dst, remaining_budget: list[int]) -> None:
+    """Stream-copy src -> dst, raising once the shared decompression budget
+    (tracked in remaining_budget[0], a one-item list so every call across
+    the whole archive shares and decrements the same counter) is exceeded.
+    Checked against actual bytes written, not the zip entry's declared
+    (attacker-controlled) size, so a mismatched/lying header can't bypass
+    this."""
+    chunk_size = 1024 * 1024
+    while True:
+        chunk = src.read(chunk_size)
+        if not chunk:
+            return
+        remaining_budget[0] -= len(chunk)
+        if remaining_budget[0] < 0:
+            raise RuntimeError(
+                "Uploaded archive decompresses to more than "
+                f"{_MAX_EXTRACTED_BYTES // (1024 * 1024)}MB and was "
+                "rejected (decompression-bomb protection). Set "
+                "MAX_UPLOAD_EXTRACTED_MB to raise this limit if your "
+                "repos are legitimately larger."
+            )
+        dst.write(chunk)
+
+
+def _win_long_path(path: str) -> str:
+    """Windows silently truncates or refuses to write any path over
+    MAX_PATH (260 characters) unless it's prefixed with \\\\?\\ to opt into
+    the OS's extended-length path support — zipfile.extractall() never did
+    this. A repo with deeply nested paths (DVWA's vulnerabilities/ tree is
+    a good real example) extracted under our already-long
+    tmp_scans/<tmpname>/extracted/ prefix could silently end up with most
+    files missing on Windows: no exception raised, just an incomplete
+    tree — which is exactly why scanning the SAME code succeeds via
+    `git clone` (a shorter path, no /extracted/ segment) but returned 0
+    findings via ZIP upload. No-op on any other OS, or a path that's
+    already prefixed."""
+    if os.name != "nt" or path.startswith("\\\\?\\"):
+        return path
+    return "\\\\?\\" + os.path.abspath(path)
+
+
+def save_and_extract_zip(uploaded_file) -> str:
+    temp_dir = tempfile.mkdtemp(dir=_TMP_ROOT)
+    zip_path = os.path.join(temp_dir, "upload.zip")
+
+    with open(zip_path, "wb") as f:
+        shutil.copyfileobj(uploaded_file.file, f)
+
+    if os.path.getsize(zip_path) > _MAX_ZIP_UPLOAD_BYTES:
+        shutil.rmtree(temp_dir, onerror=_clear_readonly_and_retry)
+        raise RuntimeError(
+            "Uploaded file exceeds the "
+            f"{_MAX_ZIP_UPLOAD_BYTES // (1024 * 1024)}MB upload limit. Set "
+            "MAX_UPLOAD_ZIP_MB to raise this if needed."
+        )
+
+    extract_path = os.path.join(temp_dir, "extracted")
+    extract_path_abs = os.path.abspath(extract_path)
+    os.makedirs(_win_long_path(extract_path), exist_ok=True)
+
+    # Extracted by hand (not zip_ref.extractall()) so every path can go
+    # through _win_long_path above. That means this loop also has to
+    # rebuild extractall()'s own path-traversal ("zip slip") protection
+    # itself — a malicious archive entry named e.g. "../../evil.sh" or
+    # given an absolute path would otherwise write outside extract_path.
+    failed: list[str] = []
+    remaining_budget = [_MAX_EXTRACTED_BYTES]  # shared, decremented across every entry below
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        for member in zip_ref.infolist():
+            target_abs = os.path.abspath(os.path.join(extract_path, member.filename))
+            if target_abs != extract_path_abs and not target_abs.startswith(extract_path_abs + os.sep):
+                logger.warning("Skipping zip entry outside extraction root: %s", member.filename)
+                continue
+            if member.is_dir():
+                os.makedirs(_win_long_path(target_abs), exist_ok=True)
+                continue
+            try:
+                os.makedirs(_win_long_path(os.path.dirname(target_abs)), exist_ok=True)
+                with zip_ref.open(member) as src, open(_win_long_path(target_abs), "wb") as dst:
+                    _copy_within_budget(src, dst, remaining_budget)
+            except OSError:
+                failed.append(member.filename)
+
+    os.remove(zip_path)  # don't need the zip anymore, just the extracted code
+
+    if failed:
+        # Something stopped these files from being written (Windows path
+        # length is the most likely cause — see _win_long_path). Surface
+        # this loudly instead of silently scanning an incomplete tree and
+        # reporting a clean-looking 0-findings result.
+        preview = ", ".join(failed[:5])
+        more = f" and {len(failed) - 5} more" if len(failed) > 5 else ""
+        raise RuntimeError(
+            f"{len(failed)} file(s) in the uploaded archive could not be extracted "
+            f"(path too long or invalid): {preview}{more}"
+        )
+
+    # GitHub's "Download ZIP" (and GitLab's/Bitbucket's equivalents) always
+    # wraps a repo's contents in a single top-level <repo>-<branch>/
+    # folder. Point the scanner at that folder directly instead of at
+    # "extracted" itself — a GitHub-URL scan and a ZIP-upload scan of the
+    # exact same repo should show the same file paths in their findings,
+    # and this is what a user visually expects after opening the extracted
+    # folder. On its own this wrapper wasn't why ZIP uploads returned 0
+    # findings (semgrep/Trivy scan recursively either way) — the actual
+    # fix for that is the long-path handling above — but it's still worth
+    # doing for consistency between the two scan methods.
+    entries = [e for e in os.listdir(extract_path) if not e.startswith(".")]
+    if len(entries) == 1 and os.path.isdir(os.path.join(extract_path, entries[0])):
+        extract_path = os.path.join(extract_path, entries[0])
+
+    return extract_path
+
+
+def cleanup_upload(extract_path: str):
+    # Walk up from extract_path to the directory directly under _TMP_ROOT
+    # and remove that -- not just dirname(extract_path). When extract_path
+    # was descended into a single wrapper folder (see save_and_extract_zip
+    # above), a single dirname() hop only reaches temp_dir/extracted, not
+    # temp_dir itself, leaving an empty directory behind (harmless --
+    # git_service.sweep_orphaned_scans() would clear it out within 24h
+    # regardless -- but there's no reason to wait for the safety net when
+    # cleanup can just do it correctly the first time).
+    if not extract_path:
+        return
+    tmp_root = os.path.abspath(_TMP_ROOT)
+    current = os.path.abspath(extract_path)
+    temp_dir = None
+    while True:
+        parent = os.path.dirname(current)
+        if parent == tmp_root:
+            temp_dir = current
+            break
+        if current == parent:  # reached filesystem root without finding it
+            break
+        current = parent
+
+    if temp_dir is None:
+        logger.warning("cleanup_upload: %s is not under %s -- refusing to delete it", extract_path, tmp_root)
+        return
+
+    try:
+        shutil.rmtree(temp_dir, onerror=_clear_readonly_and_retry)
+    except FileNotFoundError:
+        pass
